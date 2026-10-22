@@ -20,6 +20,7 @@ import (
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
+	"github.com/grafana/dskit/flagext"
 	"github.com/grafana/dskit/grpcclient"
 	"github.com/grafana/dskit/httpgrpc"
 	"github.com/grafana/dskit/instrument"
@@ -32,6 +33,7 @@ import (
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/keepalive"
+	yaml "go.yaml.in/yaml/v4"
 
 	"github.com/grafana/loki/v3/pkg/loghttp"
 	"github.com/grafana/loki/v3/pkg/logqlmodel"
@@ -165,7 +167,17 @@ func (r *RemoteEvaluator) Eval(ctx context.Context, qs string, now time.Time) (*
 
 // DialQueryFrontend creates and initializes a new httpgrpc.HTTPClient taking a QueryFrontendConfig configuration.
 func DialQueryFrontend(cfg *QueryFrontendConfig) (httpgrpc.HTTPClient, error) {
-	dialOptions, err := cfg.ClientConfig.DialOption(nil, nil, middleware.NoOpInvalidClusterValidationReporter)
+	clientConfig := cfg.ClientConfig
+	if cfg.GRPCClientConfig != nil {
+		clientConfig = *cfg.GRPCClientConfig
+	}
+	if clientConfig.MaxRecvMsgSize == 0 {
+		clientConfig.MaxRecvMsgSize = 100 << 20
+	}
+	if clientConfig.MaxSendMsgSize == 0 {
+		clientConfig.MaxSendMsgSize = 100 << 20
+	}
+	dialOptions, err := clientConfig.DialOption(nil, nil, middleware.NoOpInvalidClusterValidationReporter)
 	if err != nil {
 		return nil, err
 	}
@@ -352,6 +364,72 @@ type QueryFrontendConfig struct {
 
 	// ClientConfig allows configuring the gRPC client used to connect to the query-frontend.
 	ClientConfig grpcclient.Config `yaml:",inline"`
+
+	// GRPCClientConfig allows configuring the gRPC client via a nested grpc_client_config block,
+	// consistent with other Loki components (e.g. ingester_client, scheduler).
+	GRPCClientConfig *grpcclient.Config `yaml:"grpc_client_config,omitempty"`
+}
+
+// UnmarshalYAML implements the yaml.Unmarshaler interface.
+func (c *QueryFrontendConfig) UnmarshalYAML(value *yaml.Node) error {
+	flagext.DefaultValues(&c.ClientConfig)
+
+	type rawQueryFrontendConfig struct {
+		Address          string             `yaml:"address"`
+		ClientConfig     *grpcclient.Config `yaml:"client_config,omitempty"`
+		GRPCClientConfig *grpcclient.Config `yaml:"grpc_client_config,omitempty"`
+		Inlined          grpcclient.Config  `yaml:",inline"`
+	}
+
+	raw := rawQueryFrontendConfig{
+		Address: c.Address,
+		Inlined: c.ClientConfig,
+	}
+
+	hasGRPCClientConfig := false
+	hasClientConfig := false
+	if value.Kind == yaml.MappingNode {
+		for i := 0; i < len(value.Content); i += 2 {
+			if value.Content[i].Value == "grpc_client_config" {
+				hasGRPCClientConfig = true
+				defaultCfg := c.ClientConfig
+				raw.GRPCClientConfig = &defaultCfg
+			}
+			if value.Content[i].Value == "client_config" {
+				hasClientConfig = true
+				defaultCfg := c.ClientConfig
+				raw.ClientConfig = &defaultCfg
+			}
+		}
+	}
+
+	if err := value.Load(&raw, yaml.WithKnownFields(true)); err != nil {
+		return err
+	}
+
+	c.Address = raw.Address
+	if hasGRPCClientConfig && raw.GRPCClientConfig != nil {
+		c.ClientConfig = *raw.GRPCClientConfig
+		c.GRPCClientConfig = raw.GRPCClientConfig
+	} else if hasClientConfig && raw.ClientConfig != nil {
+		c.ClientConfig = *raw.ClientConfig
+	} else {
+		c.ClientConfig = raw.Inlined
+	}
+
+	return nil
+}
+
+func (c *QueryFrontendConfig) Validate() error {
+	if err := c.ClientConfig.Validate(); err != nil {
+		return err
+	}
+	if c.GRPCClientConfig != nil {
+		if err := c.GRPCClientConfig.Validate(); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (c *QueryFrontendConfig) RegisterFlags(f *flag.FlagSet) {
